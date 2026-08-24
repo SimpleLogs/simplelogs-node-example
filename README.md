@@ -2,7 +2,7 @@
 
 A framework-free Node server instrumented with
 [`@simplelogs/node`](https://www.npmjs.com/package/@simplelogs/node) — plain
-`node:http`, no Express, no React, no rrweb.
+`node:http`, and no browser half.
 
 **If you use Express, use
 [`@simplelogs/express`](https://github.com/SimpleLogs/simplelogs-express-example)
@@ -58,10 +58,10 @@ const requestScope = new AsyncLocalStorage();
 setAmbientCorrelationSource(() => requestScope.getStore());
 ```
 
-This is the step Next.js gets for free through `next/headers`, and the one a
-long-lived Node process has to build. It is what lets `serverLogger.log()` deep
-inside a handler pick up the caller's page and session ids without every call
-site threading `req` down to it.
+A long-lived process has to supply this scope itself, and `AsyncLocalStorage`
+is how. It is what lets `serverLogger.log()` deep inside a handler pick up the
+caller's page and session ids without every call site threading `req` down to
+it.
 
 Register the reader **once**, at module load. Re-registering per request would
 race concurrent requests through a single module-level slot.
@@ -87,8 +87,8 @@ call from curl or another server simply has none and starts its own trace.
 
 `withTrace()` seeds this request's spans with the browser trace that fired the
 fetch, so the server work joins the page's tree instead of a detached one. It
-also isolates concurrent requests from each other — something a long-lived
-process needs and a per-invocation serverless one does not.
+also isolates concurrent requests from each other, so two in flight at once
+never land in each other's traces.
 
 ## Logging and timing
 
