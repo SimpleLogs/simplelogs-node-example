@@ -22,10 +22,10 @@ configureSDK({
 });
 
 // --- 2. Give the SDK a request scope ----------------------------------------
-// Next.js hands the SDK a request scope for free through `next/headers`. A
-// long-lived Node process has to build one, and AsyncLocalStorage is how: it
-// is what lets `serverLogger.log()` deep inside a handler pick up the caller's
-// page and session ids without every call site threading `req` down to it.
+// A long-lived process has to supply this scope itself, and AsyncLocalStorage
+// is how: it is what lets `serverLogger.log()` deep inside a handler pick up
+// the caller's page and session ids without every call site threading `req`
+// down to it.
 //
 // Register the reader once. Re-registering per request would race concurrent
 // requests through this single module-level slot.
@@ -48,8 +48,8 @@ export function withRequest({ req, res, touchpoint }, handler) {
   return requestScope.run(correlation, () =>
     // Seeds this request's spans with the browser trace that fired the fetch,
     // so the server work joins the page's tree instead of a detached one.
-    // withTrace also isolates concurrent requests from each other, which a
-    // long-lived process needs and a per-invocation serverless one does not.
+    // withTrace also isolates concurrent requests from each other, so two in
+    // flight at once never land in each other's traces.
     withTrace(
       async () => {
         // Await it. start() resolves correlation before it reaches the
