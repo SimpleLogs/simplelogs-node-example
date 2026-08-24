@@ -3,6 +3,7 @@
  * ./simplelogs.js — this file is just something for it to instrument.
  */
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { serverLogger, flushServer } from "@simplelogs/node";
 import { withRequest } from "./simplelogs.js";
 
@@ -47,15 +48,22 @@ const routes = [
     // `key`, so overlapping operations stay separate, and the dashboard shows
     // how much of the response time the query accounted for.
     handler: async (_req, res) => {
-      const key = `revenue-${Date.now()}`;
+      // randomUUID, not Date.now(): start/end are matched through a map on a
+      // process-wide queue, so two requests in the same millisecond would
+      // share a timestamp key and cross each other's pairs.
+      const key = `revenue-${randomUUID()}`;
       await serverLogger.start({ key, touchpoint: "reports/revenue/query" });
 
-      const rows = await new Promise((resolve) =>
-        setTimeout(() => resolve([{ total: 4200 }]), 120),
-      );
-
-      await serverLogger.end({ key, metadata: { rowCount: rows.length } });
-      json(res, 200, rows);
+      try {
+        const rows = await new Promise((resolve) =>
+          setTimeout(() => resolve([{ total: 4200 }]), 120),
+        );
+        json(res, 200, rows);
+      } finally {
+        // In a finally: a query that throws is the one most worth timing, and
+        // a start that never closes records nothing at all.
+        await serverLogger.end({ key });
+      }
     },
   },
   {
