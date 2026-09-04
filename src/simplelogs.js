@@ -47,7 +47,10 @@ export function withRequest({ req, res, touchpoint }, handler) {
 
   return requestScope.run(correlation, () =>
     // Seeds this request's spans with the browser trace that fired the fetch,
-    // so the server work joins the page's tree instead of a detached one.
+    // so the server work joins the page's tree instead of a detached one. The
+    // request's own headers are the carrier: since 2.0.0 the SDK reads the
+    // W3C `traceparent` the browser half writes, rather than taking ids the
+    // caller has picked out of the headers itself.
     // withTrace also isolates concurrent requests from each other, so two in
     // flight at once never land in each other's traces.
     withTrace(
@@ -88,7 +91,7 @@ export function withRequest({ req, res, touchpoint }, handler) {
           throw error;
         }
       },
-      { traceId: correlation.traceId, parentSpanId: correlation.parentSpanId },
+      { name: touchpoint, carrier: req.headers },
     ),
   );
 }
