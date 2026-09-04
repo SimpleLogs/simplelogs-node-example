@@ -43,10 +43,27 @@ There are three parts.
 **1. Configure once, at startup.**
 
 ```js
-import { configureSDK } from "@simplelogs/node";
+import { configureSDK, initOtel } from "@simplelogs/node";
 
 configureSDK({ serverKey: process.env.SIMPLELOGS_SERVER_KEY });
+initOtel({ instrumentations: [] });
 ```
+
+`configureSDK()` alone gets you logging, timings and page/session correlation.
+`initOtel()` is what adds **tracing** — it installs the tracer and the
+`AsyncLocalStorage` context manager that let a span carry ids and survive an
+`await`. It reads the server key, so it goes after `configureSDK()`.
+
+Leave it out and `withTrace()` in part 3 still runs your handler, but the span
+it opens is non-recording: every entry gets a page and a session and no trace,
+with nothing logged to say so. A process that never opted into tracing is not
+misconfigured, so the SDK does not treat it as an error.
+
+`instrumentations: []` because this server continues the caller's trace
+explicitly, in part 3. The automatic alternative is
+`@opentelemetry/instrumentation-http`, an extra dependency that patches
+`node:http` at require time — worth it when the request wiring is not yours to
+change, and not worth it here, where it is.
 
 **2. Give the SDK a request scope.**
 
@@ -81,9 +98,10 @@ patched `fetch` forwards on same-origin requests, so you never name those
 headers yourself. A call from curl or another server simply has none.
 
 `withTrace()` seeds this request's spans with the browser trace that fired the
-fetch, so the server work joins the page's tree instead of a detached one. It
-also isolates concurrent requests from each other, so two in flight at once
-never land in each other's traces.
+fetch, so the server work joins the page's tree instead of a detached one. A
+caller that sends no `traceparent` opens its own trace here instead. It also
+isolates concurrent requests from each other, so two in flight at once never
+land in each other's traces. All of that rests on `initOtel()` from part 1.
 
 Hand it the request's headers as a `carrier` and it does the extracting. As of
 `@simplelogs/node` 2.0.0 the trace travels as W3C `traceparent` rather than the

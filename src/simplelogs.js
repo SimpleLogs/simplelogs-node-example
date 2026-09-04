@@ -9,6 +9,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import {
   configureSDK,
+  initOtel,
   serverLogger,
   setAmbientCorrelationSource,
   resolveCorrelationOverride,
@@ -20,6 +21,25 @@ configureSDK({
   serverKey: process.env.SIMPLELOGS_SERVER_KEY,
   environment: process.env.NODE_ENV ?? "development",
 });
+
+// Tracing is a separate opt-in from logging, and `withTrace` below is what
+// needs it: it installs the tracer and the AsyncLocalStorage context manager
+// that make a span carry ids and survive an `await`. Skip this and `withTrace`
+// still runs your function, but the span it opens is non-recording — every
+// entry then has a page and a session and no trace, silently, because a
+// process that never opted in is not misconfigured.
+//
+// After configureSDK, not before: initOtel resolves the OTLP endpoint once,
+// from the config as it stands when it runs, and warns if no key is set yet.
+// (The credential itself is re-read per export, so a key that arrives later
+// does start working — but the endpoint it goes to was already decided.)
+//
+// `instrumentations: []` because this server continues the caller's trace
+// explicitly, in withRequest below. The automatic alternative is
+// `@opentelemetry/instrumentation-http`, an extra dependency that patches
+// `node:http` at require time — worth it when the wiring is not yours to
+// change, and not worth it here, where it is.
+initOtel({ instrumentations: [] });
 
 // --- 2. Give the SDK a request scope ----------------------------------------
 // A long-lived process has to supply this scope itself, and AsyncLocalStorage
@@ -49,9 +69,11 @@ export function withRequest({ req, res, touchpoint }, handler) {
 
   return requestScope.run(correlation, () =>
     // Seeds this request's spans with the browser trace that fired the fetch,
-    // so the server work joins the page's tree instead of a detached one.
-    // withTrace also isolates concurrent requests from each other, so two in
-    // flight at once never land in each other's traces.
+    // so the server work joins the page's tree instead of a detached one. A
+    // caller that sends no `traceparent` — curl, another service — opens its
+    // own trace here instead. withTrace also isolates concurrent requests from
+    // each other, so two in flight at once never land in each other's traces.
+    // Both of those depend on initOtel() above having run.
     //
     // The headers go in whole, as a `carrier`. The trace now travels as W3C
     // `traceparent` rather than the SDK's own `x-simplelogs-trace-id` pair, and
