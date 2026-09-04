@@ -42,6 +42,8 @@ export function withRequest({ req, res, touchpoint }, handler) {
   // The ids the browser SDK's patched `fetch` forwards on same-origin
   // requests. A call from curl or another server simply has none, and starts
   // its own trace instead.
+  // Page and session ids only — the trace itself rides `traceparent` and is
+  // handled by `withTrace` below, so nothing here reads a trace id.
   const correlation = resolveCorrelationOverride({ requestHeaders: req.headers }) ?? {};
   const key = randomUUID();
 
@@ -50,6 +52,11 @@ export function withRequest({ req, res, touchpoint }, handler) {
     // so the server work joins the page's tree instead of a detached one.
     // withTrace also isolates concurrent requests from each other, so two in
     // flight at once never land in each other's traces.
+    //
+    // The headers go in whole, as a `carrier`. The trace now travels as W3C
+    // `traceparent` rather than the SDK's own `x-simplelogs-trace-id` pair, and
+    // `withTrace` does the extracting — so this hands it the request's headers
+    // rather than picking ids out of them first.
     withTrace(
       async () => {
         // Await it. start() resolves correlation before it reaches the
@@ -88,7 +95,7 @@ export function withRequest({ req, res, touchpoint }, handler) {
           throw error;
         }
       },
-      { traceId: correlation.traceId, parentSpanId: correlation.parentSpanId },
+      { carrier: req.headers },
     ),
   );
 }

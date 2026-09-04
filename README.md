@@ -73,22 +73,23 @@ import { resolveCorrelationOverride, withTrace } from "@simplelogs/node";
 
 const correlation = resolveCorrelationOverride({ requestHeaders: req.headers }) ?? {};
 
-requestScope.run(correlation, () =>
-  withTrace(handler, {
-    traceId: correlation.traceId,
-    parentSpanId: correlation.parentSpanId,
-  }),
-);
+requestScope.run(correlation, () => withTrace(handler, { carrier: req.headers }));
 ```
 
-`resolveCorrelationOverride()` pulls the ids the browser SDK's patched `fetch`
-forwards on same-origin requests, so you never name the headers yourself. A
-call from curl or another server simply has none and starts its own trace.
+`resolveCorrelationOverride()` pulls the page and session ids the browser SDK's
+patched `fetch` forwards on same-origin requests, so you never name those
+headers yourself. A call from curl or another server simply has none.
 
 `withTrace()` seeds this request's spans with the browser trace that fired the
 fetch, so the server work joins the page's tree instead of a detached one. It
 also isolates concurrent requests from each other, so two in flight at once
 never land in each other's traces.
+
+Hand it the request's headers as a `carrier` and it does the extracting. As of
+`@simplelogs/node` 2.0.0 the trace travels as W3C `traceparent` rather than the
+SDK's own `x-simplelogs-trace-id` / `x-simplelogs-parent-span` pair, so there
+are no trace ids to pick out of the headers first — `resolveCorrelationOverride`
+returns page and session ids and nothing else.
 
 ## Logging and timing
 
