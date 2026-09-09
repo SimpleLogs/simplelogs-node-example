@@ -9,6 +9,6 @@
     "dev": "node --watch --env-file-if-exists=.env src/server.js"
   },
   "dependencies": {
-    "@simplelogs/node": "^2.0.0"
+    "@simplelogs/node": "^2.0.1"
   }
 }
