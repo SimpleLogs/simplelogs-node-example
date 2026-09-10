@@ -20,8 +20,9 @@ npm install
 npm start                # http://localhost:3200
 ```
 
-Requires Node 22 or newer (`--env-file-if-exists` loads `.env` with no `dotenv`
-dependency). `npm run dev` restarts on change.
+Requires Node 24 or newer. `--env-file-if-exists` loads `.env` with no
+`dotenv` dependency — it has been available since Node 22, so it is not what
+sets the floor here. `npm run dev` restarts on change.
 
 Then exercise it:
 
