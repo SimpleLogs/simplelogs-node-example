@@ -1,0 +1,700 @@
+name: Claude PR Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+        type: string
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# A new push to the same PR cancels the in-flight review of the stale diff.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  # Which files a PR touches decides whether the review runs. That rules out
+  # the `paths-ignore` filter this workflow would otherwise use: a filtered
+  # workflow does not run at all, so it reports no check, and the review is a
+  # required one — a prose-only PR would sit unmergeable waiting for a check
+  # that is never coming. A job that decides for itself and skips still
+  # reports, and GitHub counts a skipped required check as satisfied.
+  scope:
+    name: Review scope
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code_changed }}
+      reviewer_changed: ${{ steps.filter.outputs.reviewer_changed }}
+      stale: ${{ steps.filter.outputs.stale }}
+      rereview_note: ${{ steps.rereview.outputs.note }}
+    steps:
+      # A push lands, and seconds later so does the fixup after it. The
+      # concurrency group above cancels the older run either way, but what it
+      # costs depends on where that run had got to: a review already talking to
+      # the model is cancelled mid-sentence and bills for everything it had
+      # read, having posted nothing. Waiting here puts that cancellation
+      # before the model instead of during it, so a burst of pushes pays for
+      # one review rather than one per push.
+      #
+      # Only on `synchronize`, a push onto a PR that already exists, which is
+      # the event that arrives in bursts. Opening a PR, marking it ready and
+      # dispatching a re-review are each a single deliberate act, and the wait
+      # would be latency with nothing to collapse.
+      - name: Let a burst of pushes settle
+        if: github.event.action == 'synchronize'
+        run: sleep 90
+
+      - id: filter
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          # The head the event named. Empty on a dispatch, which reviews
+          # whatever the PR's head is now.
+          EVENT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Fetched into a variable rather than piped into the loop, so that an
+          # API call that fails fails the job. Read straight from a pipe it
+          # would look like a PR that changed nothing, which reads here as
+          # "prose only" — the review would be skipped and the PR would go
+          # green ungated.
+          files=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+            --jq '.[].filename')
+
+          # Prose, images and the lockfile carry nothing for a code review to
+          # find. A dependency bump is reviewed through `package.json`, which
+          # does count, and through the code that moved with it; the resolved
+          # tree underneath it is machine-written and can only be read as
+          # thousands of lines nobody can have an opinion about. Everything
+          # else counts.
+          #
+          # This file is its own case. claude-code-action exchanges an OIDC
+          # token for an app token, and that exchange refuses a workflow whose
+          # content differs from the copy on the branch being merged into — a
+          # PR cannot grant itself a token by editing the workflow that asks
+          # for one. The action reports that refusal by logging a skip and
+          # exiting 0, which is indistinguishable here from a review that ran
+          # and found nothing, so the review is skipped rather than started:
+          # a check that cannot pass no matter how many times it is re-run is
+          # worse than an absent one. A change to this file is reviewed by a
+          # person.
+          code_changed=false
+          reviewer_changed=false
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            case "$file" in
+              .github/workflows/claude-pr-review.yml)
+                reviewer_changed=true
+                code_changed=true
+                ;;
+              package-lock.json) ;;
+              *.md | *.png | *.jpg | *.svg) ;;
+              *) code_changed=true ;;
+            esac
+          done <<< "$files"
+
+          # Whether the diff this run was told about is still the PR's diff.
+          # The wait above is one way it stops being: a push during it moves
+          # the head, and the run that event started is already answering for
+          # a commit nobody will merge. The runner queue is the other — a run
+          # can sit waiting long enough for two more pushes to land.
+          #
+          # Reviewing it anyway would cost a full review and produce findings
+          # against lines that have moved, while the push that superseded it
+          # has a run of its own that will review the head properly. Required
+          # checks are counted on the PR's head commit, so a review this run
+          # does not perform leaves nothing satisfied that should not be: the
+          # commit being merged answers for itself.
+          stale=false
+          if [ -n "${EVENT_SHA:-}" ]; then
+            current=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json headRefOid --jq .headRefOid)
+            if [ "$current" != "$EVENT_SHA" ]; then
+              stale=true
+              echo "::notice::${EVENT_SHA} is no longer this PR's head (${current} is). The run for that push reviews it."
+            fi
+          fi
+
+          {
+            echo "code_changed=${code_changed}"
+            echo "reviewer_changed=${reviewer_changed}"
+            echo "stale=${stale}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Code files changed: ${code_changed}"
+          echo "This workflow changed: ${reviewer_changed}"
+          echo "Head superseded: ${stale}"
+
+      # Most reviews on this repository are not the first review of their PR:
+      # the gate below sends findings back, they are fixed, and the push that
+      # fixes them is reviewed again. Each of those rounds differs from the one
+      # before it by the few files the fix touched, and without being told
+      # which those are the review spends its opening turns working it out
+      # from a diff it has already been given.
+      #
+      # So it is told. This is a hint and not a narrowing: the review's
+      # subject stays the PR's whole diff, because a fix in one file can
+      # break a second one that has not changed since it was last read, and
+      # because the round before this one may simply have missed something.
+      # What the hint buys is the order the review works in.
+      #
+      # The commit the last round reviewed comes out of the summary comment's
+      # own marker, which is the only place it is written down. A PR with no
+      # such comment is on its first review and gets no hint; so is one whose
+      # previous head has since been rebased away, where `compare` has no
+      # answer to give.
+      - id: rereview
+        if: steps.filter.outputs.stale != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HEAD_SHA:-}" ]; then
+            HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json headRefOid --jq .headRefOid)
+          fi
+
+          # Listed into a file rather than piped, so that a failed listing
+          # fails this step instead of reading as "no previous review" and
+          # quietly dropping the hint on every PR.
+          # The carriage return goes here rather than in the pattern below,
+          # because whether an anchored `$` matches in front of one is a
+          # property of the grep doing the matching, and GitHub hands back
+          # comment bodies broken either way.
+          marker_file="${RUNNER_TEMP}/review-marker.txt"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | (.body // "") | split("\n")[0] | rtrimstr("\r")' \
+            > "$marker_file"
+
+          # Matched only as the whole first line of a comment, which is where
+          # the summary step below puts it — a comment that quotes the marker
+          # while explaining it, as a review of this workflow would, is not
+          # that comment and does not answer for it.
+          previous=$(grep -oE '^<!-- claude-review head=[0-9a-f]{40} -->$' "$marker_file" \
+            | tail -n 1 | grep -oE '[0-9a-f]{40}' || true)
+
+          note=""
+          if [ -n "$previous" ] && [ "$previous" != "$HEAD_SHA" ]; then
+            changed=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/compare/${previous}...${HEAD_SHA}" \
+              --jq '[.files[].filename] | join("\n")' 2>/dev/null || true)
+
+            if [ -n "$changed" ]; then
+              note=$(printf '\nThis PR has been reviewed before, at %s. These are the files that have changed since that review:\n\n%s\n\nStart there and weigh them most heavily, including whether they actually fix what the last review raised. Then review the rest of the diff as well: a fix can break a file that has not changed since, and a finding the last round missed is still a finding.\n' \
+                "$previous" "$changed")
+            fi
+          fi
+
+          # A random delimiter, because what sits between the two lines is
+          # file names out of this PR's own diff. A fixed one could be closed
+          # early by a PR that adds a file named after it, and whatever
+          # followed would be read as further workflow outputs.
+          delim="REVIEW_NOTE_EOF_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          {
+            echo "note<<${delim}"
+            printf '%s\n' "$note"
+            echo "${delim}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$note" ]; then
+            echo "Re-review of a PR last reviewed at ${previous}."
+          else
+            echo "No previous review to compare against; reviewing without a hint."
+          fi
+
+  review:
+    needs: scope
+    # Runs when scope could not answer, so that an API failure there shows up
+    # as a red review rather than a skipped one — GitHub counts a skipped
+    # required check as satisfied, which is the one direction this check must
+    # never fail in.
+    #
+    # Dependabot and every other bot are excluded: claude-code-action refuses
+    # to run for a non-human actor, and a bot's run cannot read the review
+    # token anyway, so the job could only ever fail. Skipping says the same
+    # thing honestly. Tested on the sender rather than the PR's author, which
+    # is the same value the action tests — a human pushing a fixup to
+    # Dependabot's PR is a human's code and gets a review. A fork PR is
+    # skipped for the neighbouring reason: it carries none of this job's
+    # secrets, so it too could only fail.
+    if: >-
+      ${{ !cancelled()
+      && (github.event_name != 'pull_request'
+      || (!github.event.pull_request.draft
+      && github.event.sender.type != 'Bot'
+      && github.event.pull_request.head.repo.full_name == github.repository))
+      && needs.scope.outputs.reviewer_changed != 'true'
+      && needs.scope.outputs.stale != 'true'
+      && (needs.scope.result != 'success'
+      || needs.scope.outputs.code_changed == 'true') }}
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      # Defined once at job level so the retry below runs the identical review
+      # rather than a second, drifting copy of it.
+      REVIEW_PROMPT: |
+        REPO: ${{ github.repository }}
+        PR NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+
+        Review this pull request. If the repository root or .github folder
+        contains AGENTS.md, CLAUDE.md, or CONTRIBUTING.md, read them first
+        and treat them as the repository's binding standards.
+        ${{ needs.scope.outputs.rereview_note }}
+
+        Focus on, in priority order:
+        1. Bugs and correctness issues in the changed code
+        2. Security problems (exposed secrets, missing auth or validation,
+           leaked sensitive data)
+        3. Violations of the repository's documented standards
+        4. Missing or inadequate tests for the changed behavior
+
+        SEVERITY
+
+        Classify every finding as exactly one of: critical, major, medium,
+        minor, nitpick. Use the highest severity that honestly applies — do not
+        inflate to look thorough, and do not soften a real defect. The focus
+        list above says what to look for; severity says how to grade it, and the
+        summary is ordered by severity, so an issue found last is still reported
+        first if it grades highest.
+
+        - critical: ships broken or unsafe. Data loss or corruption, an auth
+          hole, a leaked secret or credential, a crash on a normal path. Merging
+          is not safe.
+        - major: a real bug or security weakness that will bite in production
+          but is narrower — a wrong result on a specific input, an unhandled
+          error path, a race, a silent no-op on a documented path. Should be
+          fixed before merge.
+        - medium: works today but is fragile or wrong in principle — an edge
+          case left unhandled, a leaky abstraction, a violation of a standard
+          this repository actually documents, or missing tests where this
+          repository has tests to add them to. Fix before merge or file a
+          follow-up.
+        - minor: small, low-risk improvement — an unclear name, a guard that is
+          currently unreachable, a duplicated block worth extracting. Author's
+          judgement whether to act now.
+        - nitpick: purely optional preference with no functional impact. Say
+          plainly that it is optional and never block on it.
+
+        Skip whitespace, import order, quote style, and anything else a
+        formatter or linter would settle — those are not nitpicks, they are
+        noise, whether or not this repository runs such a tool. Skip
+        praise-only comments.
+
+        COMMENT FORMAT
+
+        Every finding — every inline comment, and every finding listed in the
+        summary — takes exactly this shape:
+
+            [severity] - Short title naming the problem
+
+            Non-technical description.
+
+            ---
+
+            Technical description.
+
+        The four-space inset above is only to set the template apart in these
+        instructions. Do not indent the comment itself: an indented block
+        renders as code, which would print the `---` as three literal hyphens.
+
+        Line by line:
+        - `[severity]` is the literal bracketed word: `[nitpick]`, `[minor]`,
+          `[medium]`, `[major]` or `[critical]` — lower case, no bold, no emoji.
+          Then a space, a hyphen, a space, then the title. On an inline comment
+          it has to be the first line, with nothing before it: the check that
+          gates this PR reads that line.
+        - The title is a single line under about ten words that names the
+          problem rather than its location: "Signed-out visitors can open
+          another team's dashboard", not "Issue in route.ts".
+        - The non-technical description is two or three sentences someone who
+          cannot read the diff can follow. Say what a user or the business would
+          actually experience if this ships — no jargon, no identifiers, no
+          code, no file names. "Someone who is not signed in can open a page
+          showing another team's data", not "the session check is missing on the
+          route handler". Where a finding genuinely has no such consequence —
+          normal for a nitpick, common for a minor — say so plainly and say who
+          it does help instead, usually the next person to work on this. Never
+          invent an impact to fill the slot.
+        - `---` sits alone on its own line, and the blank line ABOVE it is the
+          one that matters. Without it, Markdown reads the `---` as underlining
+          what precedes it: the whole description is swallowed into a heading
+          and no rule is drawn at all. A blank line below is not required — keep
+          one anyway so the two halves read apart.
+        - The technical description carries the mechanism, the file and line,
+          the condition that triggers it, and a concrete suggested fix. Code
+          blocks and identifiers belong here, and only here.
+
+        Both halves are required on every finding at every severity — a nitpick
+        still gets its plain-language half.
+
+        Rules for your review:
+        - Only review the diff of this PR, not pre-existing code.
+        - Never read package-lock.json. It is machine-written, it is
+          excluded from what decides whether this review runs at all, and a
+          dependency change is reviewed through package.json and the code that
+          moved with it.
+        - Use inline comments (mcp__github_inline_comment__create_inline_comment)
+          for line-specific findings. A finding with no line to hang off —
+          a missing migration, absent coverage, a problem that spans files —
+          has no inline comment to make and lives only in your result.
+        - Do not post the summary yourself. Return it in your result and this
+          workflow posts it, as one comment kept up to date across the
+          reviews of this PR.
+
+        YOUR RESULT
+
+        Finish by returning a result matching the schema you were given:
+
+        - `critical`, `major`, `medium`, `minor`, `nitpick`: how many
+          findings you raised at each severity, counting every finding you
+          raised anywhere — inline and summary-only alike. The check that
+          gates this PR adds up the first three, so a count is a decision
+          about whether the PR ships, and it is read as stated. Count
+          honestly in both directions.
+        - `verdict`: one paragraph of plain language a non-technical reader
+          can act on. Drive it from the highest severity present: any
+          critical or major means do not merge yet; medium means fix or file
+          a follow-up before merging; minor and nitpick leave the PR ready
+          as it stands and are answered on the PR rather than before it.
+        - `summary_markdown`: every finding you raised anywhere, in the
+          comment format above, grouped most severe first. Ones you left
+          inline are repeated here. If the PR looks good, say so briefly —
+          do not invent findings to seem thorough.
+      # `--effort high` is spelled out because claude-opus-5-5 defaults to
+      # medium, where the model before it defaulted to high. Left unsaid, the
+      # switch would have quietly bought a cheaper review as well as a cheaper
+      # token, and depth is the one thing this review does not trade.
+      #
+      # `--max-turns` bounds the tail rather than the ordinary run: reviews on
+      # this repository land between twenty and a hundred and twenty turns,
+      # most of which are the inline comments themselves, so this is headroom
+      # over the longest real review and a ceiling under a runaway one.
+      #
+      # `--json-schema` is what the gate below counts. It makes the action
+      # fail its own step unless the session returns a result matching this
+      # shape, which is also the only proof the workflow needs that a review
+      # actually happened — a session that dies, or that the token exchange
+      # refuses, returns nothing to validate and cannot be mistaken for a
+      # review that found nothing.
+      REVIEW_ARGS: |
+        --model claude-opus-5-5
+        --effort high
+        --max-turns 150
+        --json-schema '{"type":"object","properties":{"critical":{"type":"integer","minimum":0},"major":{"type":"integer","minimum":0},"medium":{"type":"integer","minimum":0},"minor":{"type":"integer","minimum":0},"nitpick":{"type":"integer","minimum":0},"verdict":{"type":"string"},"summary_markdown":{"type":"string"}},"required":["critical","major","medium","minor","nitpick","verdict","summary_markdown"],"additionalProperties":false}'
+        --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh api:*),Bash(git log:*),Bash(git show:*),Read,Grep,Glob,LS"
+    steps:
+      - name: Require a scope verdict
+        if: needs.scope.result != 'success'
+        run: |
+          echo "::error::Could not determine which files this PR changes, so it cannot be reviewed. Re-run this workflow run."
+          exit 1
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      # How long the attempt below lasted, which is what decides whether the
+      # retry after it is worth paying for.
+      - name: Record when the review started
+        id: started
+        run: echo "at=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+
+      # `track_progress` is deliberately not set. It is what the action reads
+      # to decide between its two modes, and with it on a pull_request event
+      # it takes the tag-mode path: it prepends the PR body and every review
+      # comment the PR has ever collected — each one carrying the diff hunk it
+      # was anchored to — in front of this prompt, then re-reads all of it on
+      # every turn of the session.
+      #
+      # On a PR being reviewed for the first time that is merely wasteful. On
+      # the fourth or tenth round of the gate below it is the largest single
+      # cost of the review, and it grows with each round: the reviews of one
+      # PR on this repository accumulated three hundred inline comments,
+      # around three hundred thousand tokens, all of it findings the author
+      # had already fixed, carried in front of every later review of that PR.
+      #
+      # Without it the action runs in agent mode, where the prompt is exactly
+      # what is written above. The review still reaches anything it wants
+      # through `gh`, including the comments it left last time, and the cost
+      # of reading them is paid only where it decides to.
+      #
+      # Agent mode creates no comment of its own, so `use_sticky_comment` has
+      # nothing to act on either and the summary is posted by this workflow
+      # instead, below. Inline comments are unaffected: that MCP server is
+      # switched on by the allowed tool naming it, in either mode.
+      - id: review
+        uses: anthropics/claude-code-action@v1
+        continue-on-error: true
+        with:
+          # Org-level secret; bills against the Claude subscription
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ env.REVIEW_PROMPT }}
+          claude_args: ${{ env.REVIEW_ARGS }}
+
+      # The failure this retries is a startup one: the session reports an
+      # error on its first turn having made no model call at all, in under a
+      # second, and succeeds on a plain re-run. It has produced three false
+      # review failures on this repo, each of which reads exactly like a
+      # review that found nothing — no comments, a red check — which is the
+      # expensive half, since the natural response to it is to merge.
+      #
+      # One retry, not a loop: an attempt that got far enough to post inline
+      # comments before dying would repeat them, so this buys back the
+      # transient case without turning a genuine mid-run failure into noise.
+      #
+      # Bounded by how long the attempt lasted, because that is what tells the
+      # two kinds of failure apart. The startup failure is over in seconds,
+      # and retrying it costs seconds. A session that dies an hour in has read
+      # the whole diff and written most of a review, and retrying that pays
+      # for a second full review to recover a run that was nearly done — on a
+      # failure the re-run the error below asks for would address anyway.
+      - name: Decide whether the failure is worth retrying
+        id: retriable
+        if: steps.review.outcome == 'failure'
+        env:
+          STARTED_AT: ${{ steps.started.outputs.at }}
+        run: |
+          set -euo pipefail
+
+          elapsed=$(( $(date -u +%s) - STARTED_AT ))
+          if [ "$elapsed" -le 180 ]; then
+            echo "worth=true" >> "$GITHUB_OUTPUT"
+            echo "The review failed after ${elapsed}s, which is the startup failure's shape. Retrying once."
+          else
+            echo "worth=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::The review failed after ${elapsed}s, far enough in that a retry would pay for a second full review. Re-run this workflow run if the failure looks transient."
+          fi
+
+      # Checked out again first: the attempt above leaves the checkout's git
+      # credentials unusable, so the retry's own `git fetch origin` died with
+      # "Authentication failed" before reaching the model — every retry failed
+      # for a reason that had nothing to do with what it was retrying.
+      - if: steps.retriable.outputs.worth == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - id: retry
+        if: steps.retriable.outputs.worth == 'true'
+        uses: anthropics/claude-code-action@v1
+        continue-on-error: true
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ env.REVIEW_PROMPT }}
+          claude_args: ${{ env.REVIEW_ARGS }}
+
+      # Both halves of what the review produced arrive here as one validated
+      # object, because `--json-schema` above makes the action fail unless the
+      # session returns one. That is this step's proof a review happened, and
+      # it cannot be confused with a review that found nothing: a session that
+      # made no model call, and the token exchange the scope job describes
+      # refusing a changed workflow, both return nothing to validate.
+      - name: Read what the review returned
+        id: result
+        # Not where the scope job could not answer: the first step of this job
+        # has already failed over that, with the error that actually describes
+        # it, and no review was started to have returned anything.
+        if: ${{ !cancelled() && needs.scope.result == 'success' }}
+        env:
+          REVIEW_RESULT: ${{ steps.review.outputs.structured_output }}
+          RETRY_RESULT: ${{ steps.retry.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+
+          # The retry's result where there was a retry, the first attempt's
+          # otherwise. Taken in that order rather than by step outcome, so
+          # that an attempt which returned a valid result is used even if the
+          # action's step went red afterwards.
+          result="${RETRY_RESULT:-}"
+          [ -n "$result" ] || result="${REVIEW_RESULT:-}"
+
+          if [ -z "$result" ]; then
+            echo "::error::No review session completed on this PR — no attempt returned a result. This is what a session that made no model call looks like, as well as the token exchange refusing a changed workflow. Re-run this workflow run."
+            exit 1
+          fi
+
+          path="${RUNNER_TEMP}/review-result.json"
+          printf '%s' "$result" > "$path"
+
+          # Validated against the schema before it got here, so this only
+          # guards against the action handing over something that is not the
+          # object at all — in which case the counts below would every one of
+          # them read as zero, which is silent and in the unsafe direction.
+          if ! jq -e 'type == "object" and has("critical") and has("summary_markdown")' "$path" > /dev/null; then
+            echo "::error::The review returned a result that is not the shape this gate reads. Re-run this workflow run."
+            exit 1
+          fi
+
+          echo "path=${path}" >> "$GITHUB_OUTPUT"
+
+      # The review's summary, as one comment kept up to date across every
+      # review of this PR rather than a new one per push. Posted from here
+      # because agent mode leaves the session no comment of its own to write
+      # into, and posted before the gate below so that a PR the gate is about
+      # to redden still carries the findings explaining why.
+      #
+      # The marker on the first line names the commit this summary describes.
+      # That is what makes a stale summary legible — a head that is visibly
+      # not the PR's — and it is where the scope job reads the previously
+      # reviewed commit from when it works out what a re-review should look at
+      # first.
+      - name: Post the review summary on the PR
+        # Nothing to post where no attempt returned a result, and the step
+        # above has already failed the job over it.
+        if: ${{ !cancelled() && steps.result.outputs.path != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RESULT: ${{ steps.result.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HEAD_SHA:-}" ]; then
+            HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json headRefOid --jq .headRefOid)
+          fi
+
+          body="${RUNNER_TEMP}/review-summary.md"
+          {
+            printf '<!-- claude-review head=%s -->\n' "$HEAD_SHA"
+            printf '### Claude review of `%s`\n\n' "$HEAD_SHA"
+            jq -r '.verdict' "$RESULT"
+            printf '\n\n'
+            jq -r '.summary_markdown' "$RESULT"
+          } > "$body"
+
+          # Matched on the marker's shape rather than on the exact commit, so
+          # that the comment found is the one this workflow last wrote on this
+          # PR whichever commit it described, and only when the marker is the
+          # whole first line — a comment that quotes it while explaining it,
+          # as a review of this workflow would, is not this comment and must
+          # not be overwritten by it.
+          #
+          # Listed into a file rather than piped: --paginate applies the
+          # filter to each page separately, so the ids arrive one per line,
+          # and a failed listing has to fail the step rather than read as "no
+          # comment yet" and post a duplicate.
+          ids="${RUNNER_TEMP}/review-comment-ids.txt"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.user.login == "github-actions[bot]" and (((.body // "") | split("\n")[0] | rtrimstr("\r")) | test("^<!-- claude-review head=[0-9a-f]{40} -->$"))) | .id] | .[]' \
+            > "$ids"
+          existing=$(head -n 1 "$ids")
+
+          # The request body is assembled by jq and handed over whole, rather
+          # than passed as a field. A summary is markdown the review wrote: it
+          # runs to many lines and contains code blocks, quotes and braces,
+          # and `--field` reads a value that parses as JSON as JSON rather
+          # than as the string it is.
+          payload="${RUNNER_TEMP}/review-comment.json"
+          jq -n --rawfile body "$body" '{body: $body}' > "$payload"
+
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \
+              --input "$payload"
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --input "$payload"
+          fi
+
+      # What makes this check a gate rather than a record that a review
+      # happened. The review's own exit status only says the session ran, so a
+      # PR carrying a critical finding went green on it. This counts the
+      # findings and fails on anything at medium or above. A minor finding and
+      # a nitpick are counted without failing it: neither is a reason the PR
+      # cannot ship, so they are answered on the PR rather than standing in
+      # front of it.
+      #
+      # Counted from two places, and each severity takes the higher of the
+      # two. The review's own counts are the complete half — they cover a
+      # finding with no line to hang off, which is never inline — and they are
+      # a number it states rather than a shape its prose has to hold. The
+      # inline comments are the half it cannot misreport, since the action
+      # posts a finding's body verbatim and its tag really is the first line.
+      # Disagreement between the two resolves upward: over-counting costs a
+      # push, under-counting ships the finding.
+      - name: Fail on findings of medium severity or worse
+        # Nothing to count where no attempt returned a result. That is not a
+        # pass: the step that reads the result has already failed the job,
+        # which is the fail-closed direction, and counting zero findings out
+        # of an absent review here would be the other one.
+        if: ${{ !cancelled() && steps.result.outputs.path != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          # The commit the event named, so that a push arriving between the
+          # review and this step cannot move what is being counted. Empty on a
+          # dispatch, which has only a PR number to go on.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RESULT: ${{ steps.result.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HEAD_SHA:-}" ]; then
+            HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json headRefOid --jq .headRefOid)
+          fi
+          export HEAD_SHA
+
+          # An inline comment carries exactly one finding, and its tag is the
+          # first line, so only that line is read: a severity quoted inside the
+          # explanation — as a review of this workflow would quote it — is not
+          # a finding of its own.
+          #
+          # Matched on the commit the comment was written against, not the one
+          # it currently applies to: GitHub re-anchors `commit_id` to the head
+          # of the branch as it moves, so a finding from an earlier push would
+          # answer to every later commit and the check could never go green
+          # again. `original_commit_id` is the one that stays put, which makes
+          # this exactly the findings of the review that just ran.
+          #
+          # Two authors, because an inline comment is posted under whichever
+          # token the run was given: the review app's where the exchange
+          # granted one, the runner's own otherwise.
+          inline="${RUNNER_TEMP}/inline.txt"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments" \
+            --jq '.[] | select((.user.login == "claude[bot]" or .user.login == "github-actions[bot]") and .original_commit_id == env.HEAD_SHA) | .body | split("\n")[0]' \
+            > "$inline"
+
+          blocking=0
+          counts=""
+          for severity in critical major medium minor nitpick; do
+            stated=$(jq -r --arg s "$severity" '.[$s] // 0' "$RESULT")
+            observed=$(grep -cE "^\[${severity}\] - " "$inline" || true)
+            # The higher of the two. Over-counting costs a push;
+            # under-counting ships the finding.
+            count=$(( stated > observed ? stated : observed ))
+            counts="${counts}${count} ${severity}, "
+            case "$severity" in
+              minor | nitpick) ;;
+              *) blocking=$((blocking + count)) ;;
+            esac
+          done
+
+          echo "Findings on ${HEAD_SHA}: ${counts%, }"
+          {
+            echo "### Claude review: ${counts%, }"
+            echo
+            jq -r '.verdict' "$RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$blocking" -gt 0 ]; then
+            echo "::error::${blocking} finding(s) at medium severity or worse. Address them and push again."
+            exit 1
+          fi
